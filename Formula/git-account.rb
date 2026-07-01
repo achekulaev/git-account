@@ -8,7 +8,7 @@ class GitAccount < Formula
   desc "Per-repo GitHub account switcher (identity + auth + signing)"
   homepage "https://github.com/achekulaev/git-account"
   url "https://github.com/achekulaev/git-account/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "TBD_UPDATED_AFTER_RELEASE"
+  sha256 "910f16a3d5e5ac56b4f5b139ca33fe05ace7cdf415eed22192353b5c8d44acc5"
   license "MIT"
   version "0.1.1"
 
