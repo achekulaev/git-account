@@ -18,6 +18,23 @@ $ git account apply            # auto-detects via the rule, or asks once and rem
 git-account: applied profile 'work' (auto-detected from github.com).
 ```
 
+Or do the clone and apply in one step — `git account clone` picks the right
+account's SSH key for the initial handshake, then bakes it into the new repo:
+
+```
+$ git account clone git@github.com:acme-corp/service.git
+git-account: using profile 'work' for clone (auto-detected from github.com).
+git-account: repo now uses profile 'work' (me@corp.com).
+$ cd service                  # already wired to 'work', nothing else to do
+```
+
+Force a specific account with `--as` (handy when several match, or on a first
+clone before any rule exists):
+
+```
+$ git account clone --as work git@github.com:acme-corp/service.git
+```
+
 ## How it works
 
 Everything maps onto native git config keys, so "remembering" is free:
