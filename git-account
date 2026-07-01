@@ -290,14 +290,14 @@ cmd_rule() {
   case "$sub" in
     add)
       local pattern="${1:-}" name="${2:-}"
-      [ -n "$pattern" ] && [ -n "$name" ] || die "usage: git account rule add <host[/owner]> <profile>"
+      if [ -z "$pattern" ] || [ -z "$name" ]; then die "usage: git account rule add <host[/owner]> <profile>"; fi
       profile_require "$name"
       rule_add "$name" "$pattern"
       ok "rule added: $pattern -> $name"
       ;;
     remove|rm)
       local pattern="${1:-}" name="${2:-}"
-      [ -n "$pattern" ] && [ -n "$name" ] || die "usage: git account rule remove <host[/owner]> <profile>"
+      if [ -z "$pattern" ] || [ -z "$name" ]; then die "usage: git account rule remove <host[/owner]> <profile>"; fi
       rule_remove "$name" "$pattern"
       ok "rule removed: $pattern -> $name"
       ;;
