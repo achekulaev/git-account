@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+#
+# git-account - per-repo GitHub account switcher (identity + auth + signing).
+#
+# Installed as `git-account` on PATH, git invokes it as `git account ...`.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# --- locate ourselves (resolving symlinks) so we can source lib/ -----------
+_resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) : ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+GA_ROOT="$(_resolve_self)"
+GA_HOOKS_DIR="$GA_ROOT/hooks"
+
+# In a bundled single-file build the lib is inlined; otherwise source it.
+if [ -d "$GA_ROOT/lib" ]; then
+  # shellcheck source=lib/common.sh
+  . "$GA_ROOT/lib/common.sh"
+  # shellcheck source=lib/profiles.sh
+  . "$GA_ROOT/lib/profiles.sh"
+  # shellcheck source=lib/detect.sh
+  . "$GA_ROOT/lib/detect.sh"
+  # shellcheck source=lib/auth.sh
+  . "$GA_ROOT/lib/auth.sh"
+  # shellcheck source=lib/sign.sh
+  . "$GA_ROOT/lib/sign.sh"
+  # shellcheck source=lib/apply.sh
+  . "$GA_ROOT/lib/apply.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# interactive helpers
+# ---------------------------------------------------------------------------
+
+# prompt_select "message" choice1 choice2 ...  -> echoes chosen value
+prompt_select() {
+  local msg="$1"; shift
+  local -a choices=("$@")
+  local i choice
+  printf '%s\n' "$msg" >&2
+  for i in "${!choices[@]}"; do
+    printf '  %d) %s\n' "$((i + 1))" "${choices[$i]}" >&2
+  done
+  while :; do
+    printf 'Choose [1-%d]: ' "${#choices[@]}" >&2
+    read -r choice || return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#choices[@]}" ]; then
+      printf '%s\n' "${choices[$((choice - 1))]}"
+      return 0
+    fi
+  done
+}
+
+prompt_default() {
+  local msg="$1" def="${2:-}" ans
+  if [ -n "$def" ]; then
+    printf '%s [%s]: ' "$msg" "$def" >&2
+  else
+    printf '%s: ' "$msg" >&2
+  fi
+  read -r ans || true
+  printf '%s\n' "${ans:-$def}"
+}
+
+prompt_yesno() {
+  local msg="$1" def="${2:-n}" ans hint="[y/N]"
+  [ "$def" = "y" ] && hint="[Y/n]"
+  printf '%s %s ' "$msg" "$hint" >&2
+  read -r ans || true
+  ans="${ans:-$def}"
+  case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+# Generate a new ed25519 SSH key for an account and echo its private-key path.
+# All human-facing output goes to stderr so the path can be captured.
+generate_ssh_key() {
+  local id="$1" email="$2" host="$3" dir="$HOME/.ssh" path
+  mkdir -p "$dir"; chmod 700 "$dir" 2>/dev/null || true
+  path="$dir/id_ed25519_$id"
+  if [ -e "$path" ]; then
+    warn "SSH key already exists at $path -- using it."
+    printf '%s\n' "$path"; return 0
+  fi
+  info "generating a new ed25519 SSH key at $path ..."
+  if [ -t 0 ]; then
+    # Real terminal: let ssh-keygen prompt for an optional passphrase.
+    ssh-keygen -t ed25519 -f "$path" -C "${email:-$id}" >&2 || die "ssh-keygen failed."
+  else
+    # Non-interactive (e.g. tests): no passphrase to avoid a blocking prompt.
+    ssh-keygen -t ed25519 -f "$path" -C "${email:-$id}" -N "" >&2 || die "ssh-keygen failed."
+  fi
+  ok "created SSH key pair:"
+  info "  private: $path"
+  info "  public:  $path.pub"
+  warn "ACTION REQUIRED: add the PUBLIC key to your $host account:"
+  warn "  $host -> Settings -> SSH and GPG keys -> New SSH key -> paste the key below"
+  printf '%s\n' "----------------------------------------------------------------" >&2
+  cat "$path.pub" >&2 || true
+  printf '%s\n' "----------------------------------------------------------------" >&2
+  printf '%s\n' "$path"
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+cmd_add() {
+  local name="" f_name="" f_email="" f_host="" f_sshkey=""
+  local f_signkey="" f_gpgformat="" f_sign="" f_cred=""
+  local host_explicit=0 sshkey_explicit=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)            f_name="$2"; shift 2 ;;
+      --email)           f_email="$2"; shift 2 ;;
+      --host)            f_host="$2"; host_explicit=1; shift 2 ;;
+      --ssh-key)         f_sshkey="$2"; sshkey_explicit=1; shift 2 ;;
+      --signing-key)     f_signkey="$2"; shift 2 ;;
+      --gpg-format)      f_gpgformat="$2"; shift 2 ;;
+      --sign)            f_sign="$2"; shift 2 ;;
+      --credential-user) f_cred="$2"; shift 2 ;;
+      -*)                die "unknown flag for add: $1" ;;
+      *)                 if [ -z "$name" ]; then name="$1"; else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+
+  # Interactive wizard: prompt for anything still missing.
+  if is_tty; then
+    if [ -z "$name" ]; then
+      name="$(prompt_default 'Account id (e.g. work, personal)')"
+    fi
+    profile_valid_name "$name" || die "invalid profile name '$name' (use letters, digits, '.', '_', '-')."
+    if profile_exists "$name"; then warn "profile '$name' already exists -- updating it."; fi
+
+    [ -n "$f_name" ]  || f_name="$(prompt_default 'Full name (e.g. John Smith)')"
+    [ -n "$f_email" ] || f_email="$(prompt_default 'Email (should match the address you sign in with)')"
+    [ "$host_explicit" -eq 1 ] || f_host="$(prompt_default 'Git host' 'github.com')"
+
+    if [ "$sshkey_explicit" -ne 1 ]; then
+      local ans
+      ans="$(prompt_default 'SSH private key path (Enter = generate a new key, "none" = skip)')"
+      case "$ans" in
+        "")          f_sshkey="$(generate_ssh_key "$name" "$f_email" "${f_host:-github.com}")" ;;
+        none|skip|-) f_sshkey="" ;;
+        *)           f_sshkey="$(expand_tilde "$ans")" ;;
+      esac
+    fi
+
+    # Offer to reuse the SSH key for commit signing (modern SSH signing).
+    if [ -n "$f_sshkey" ] && [ -z "$f_signkey" ]; then
+      if prompt_yesno 'Use this SSH key to sign commits too?' n; then
+        f_signkey="${f_sshkey}.pub"; f_gpgformat="ssh"; f_sign="true"
+      fi
+    fi
+  fi
+
+  [ -n "$name" ] || die "usage: git account add <name> [flags]   (run without flags for an interactive wizard)"
+  profile_valid_name "$name" || die "invalid profile name '$name' (use letters, digits, '.', '_', '-')."
+  [ -n "$f_name" ]  || die "profile requires a name (--name), or run interactively."
+  [ -n "$f_email" ] || die "profile requires an email (--email), or run interactively."
+  [ -n "$f_host" ]  || f_host="github.com"
+
+  profile_set "$name" name  "$f_name"
+  profile_set "$name" email "$f_email"
+  profile_set "$name" host  "$f_host"
+  [ -n "$f_sshkey" ]    && profile_set "$name" sshkey "$f_sshkey"
+  [ -n "$f_signkey" ]   && profile_set "$name" signingkey "$f_signkey"
+  [ -n "$f_gpgformat" ] && profile_set "$name" gpgformat "$f_gpgformat"
+  [ -n "$f_sign" ]      && profile_set "$name" sign "$f_sign"
+  [ -n "$f_cred" ]      && profile_set "$name" credentialuser "$f_cred"
+
+  # A host-level rule lets auto-detect find this profile immediately.
+  rule_add "$name" "$f_host"
+
+  ok "saved profile '$name' ($f_email)."
+  [ -n "$f_sshkey" ] && info "ssh key: $f_sshkey"
+  return 0
+}
+
+cmd_list() {
+  local names name
+  names="$(profile_names)"
+  if [ -z "$names" ]; then
+    info "no profiles yet. Add one with: git account add <name> --name .. --email .."
+    return 0
+  fi
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    printf '%s%s%s\n' "$GA_GRN" "$name" "$GA_RST"
+    printf '    name:    %s\n' "$(profile_get "$name" name)"
+    printf '    email:   %s\n' "$(profile_get "$name" email)"
+    local host sshkey signkey
+    host="$(profile_get "$name" host || true)";   [ -n "$host" ]   && printf '    host:    %s\n' "$host"
+    sshkey="$(profile_get "$name" sshkey || true)"; [ -n "$sshkey" ] && printf '    sshkey:  %s\n' "$sshkey"
+    signkey="$(profile_get "$name" signingkey || true)"; [ -n "$signkey" ] && printf '    signing: %s (%s)\n' "$signkey" "$(profile_get "$name" gpgformat || echo openpgp)"
+    local rules
+    rules="$(git config -f "$GA_CONFIG_FILE" --get-all "rule.$name" 2>/dev/null | paste -sd ' ' - || true)"
+    [ -n "$rules" ] && printf '    rules:   %s\n' "$rules"
+  done <<< "$names"
+}
+
+cmd_whoami() {
+  require_repo
+  local profile url
+  profile="$(local_get account.profile || true)"
+  url="$(git config --get remote.origin.url 2>/dev/null || true)"
+  printf 'repo:     %s\n' "$(git rev-parse --show-toplevel)"
+  printf 'remote:   %s\n' "${url:-<none>}"
+  if [ -n "$profile" ]; then
+    printf 'profile:  %s%s%s\n' "$GA_GRN" "$profile" "$GA_RST"
+  else
+    printf 'profile:  %s<unassigned>%s\n' "$GA_YEL" "$GA_RST"
+  fi
+  printf 'identity: %s <%s>\n' "$(git config --get user.name || echo '?')" "$(git config --get user.email || echo '?')"
+  local sc; sc="$(git config --local --get core.sshCommand || true)"
+  [ -n "$sc" ] && printf 'ssh:      %s\n' "$sc"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: git account use <profile>"
+  apply_profile "$name"
+  ok "repo now uses profile '$name' ($(profile_get "$name" email))."
+}
+
+cmd_apply() {
+  require_repo
+
+  # If this repo is already assigned a (still-existing) profile, honor it
+  # idempotently instead of re-detecting. This is what `clone`/`use` bake in,
+  # so re-running `git account` here should never re-prompt.
+  local assigned; assigned="$(local_get account.profile || true)"
+  if [ -n "$assigned" ] && profile_exists "$assigned"; then
+    apply_profile "$assigned"
+    ok "profile '$assigned' already assigned to this repo (use 'git account use <name>' to change)."
+    return 0
+  fi
+
+  detect_for_repo
+  case "$GA_DETECT_STATE" in
+    confident)
+      apply_profile "$GA_DETECT_PROFILE"
+      ok "applied profile '$GA_DETECT_PROFILE' (auto-detected from $GA_HOST)."
+      ;;
+    ambiguous)
+      if ! is_tty; then
+        die "multiple profiles match $GA_HOST ($(printf '%s' "$GA_DETECT_CANDIDATES" | paste -sd ',' -)). Pick one: git account use <profile>"
+      fi
+      split_lines "$GA_DETECT_CANDIDATES"
+      local pick; pick="$(prompt_select "Multiple accounts match $GA_HOST/$GA_OWNER:" "${GA_LINES[@]}")" || die "cancelled."
+      apply_profile "$pick"
+      # Remember the owner-level choice so it is silent next time.
+      [ -n "$GA_OWNER" ] && rule_add "$pick" "$GA_HOST/$GA_OWNER"
+      ok "applied profile '$pick' and remembered rule $GA_HOST/$GA_OWNER -> $pick."
+      ;;
+    none|noremote)
+      local names; names="$(profile_names)"
+      [ -n "$names" ] || die "no profiles defined. Add one: git account add <name> ..."
+      if ! is_tty; then
+        die "could not auto-detect an account for this repo. Assign one: git account use <profile>"
+      fi
+      split_lines "$names"
+      local pick; pick="$(prompt_select "Which account for this repo?" "${GA_LINES[@]}")" || die "cancelled."
+      apply_profile "$pick"
+      if [ "$GA_DETECT_STATE" != "noremote" ] && [ -n "${GA_OWNER:-}" ]; then
+        rule_add "$pick" "$GA_HOST/$GA_OWNER"
+        ok "applied profile '$pick' and remembered rule $GA_HOST/$GA_OWNER -> $pick."
+      else
+        ok "applied profile '$pick'."
+      fi
+      ;;
+  esac
+}
+
+cmd_rule() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    add)
+      local pattern="${1:-}" name="${2:-}"
+      [ -n "$pattern" ] && [ -n "$name" ] || die "usage: git account rule add <host[/owner]> <profile>"
+      profile_require "$name"
+      rule_add "$name" "$pattern"
+      ok "rule added: $pattern -> $name"
+      ;;
+    remove|rm)
+      local pattern="${1:-}" name="${2:-}"
+      [ -n "$pattern" ] && [ -n "$name" ] || die "usage: git account rule remove <host[/owner]> <profile>"
+      rule_remove "$name" "$pattern"
+      ok "rule removed: $pattern -> $name"
+      ;;
+    list|"")
+      local out; out="$(rule_list)"
+      if [ -n "$out" ]; then printf '%s\n' "$out"; else info "no rules defined."; fi
+      ;;
+    *) die "unknown rule subcommand: $sub" ;;
+  esac
+}
+
+cmd_clone() {
+  # Pull out our own --as flag; everything else is forwarded to git clone.
+  local as_profile=""
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as)   as_profile="${2:-}"; shift 2 ;;
+      --as=*) as_profile="${1#--as=}"; shift ;;
+      *)      args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  local url="${1:-}"; shift || true
+  [ -n "$url" ] || die "usage: git account clone [--as <profile>] <url> [dir]"
+
+  # Decide which profile (if any) should authenticate the *initial* clone.
+  # No repo exists yet, so we can't rely on repo-local config; instead we
+  # force the profile's key via a one-shot `-c core.sshCommand` on the clone.
+  local profile=""
+  if [ -n "$as_profile" ]; then
+    profile_require "$as_profile"
+    profile="$as_profile"
+  else
+    detect_for_url "$url"
+    case "$GA_DETECT_STATE" in
+      confident)
+        profile="$GA_DETECT_PROFILE"
+        info "using profile '$profile' for clone (auto-detected from $GA_HOST)."
+        ;;
+      ambiguous)
+        if is_tty; then
+          split_lines "$GA_DETECT_CANDIDATES"
+          profile="$(prompt_select "Multiple accounts match $GA_HOST/$GA_OWNER:" "${GA_LINES[@]}")" || die "cancelled."
+        else
+          warn "multiple profiles match $GA_HOST; cloning with default credentials."
+          warn "Force one with: git account clone --as <profile> $url"
+        fi
+        ;;
+    esac
+  fi
+
+  # Build one-shot config overrides so the first handshake uses this account.
+  local -a copts=()
+  if [ -n "$profile" ]; then
+    local sshcmd host cred
+    sshcmd="$(profile_ssh_command "$profile")"
+    [ -n "$sshcmd" ] && copts+=(-c "core.sshCommand=$sshcmd")
+    host="$(profile_get "$profile" host || true)"
+    cred="$(profile_get "$profile" credentialuser || true)"
+    [ -n "$host" ] && [ -n "$cred" ] && copts+=(-c "credential.https://$host.username=$cred")
+  fi
+
+  git clone ${copts[@]+"${copts[@]}"} "$url" "$@"
+
+  # Determine target dir the way git does when not given explicitly.
+  local dir="${1:-}"
+  if [ -z "$dir" ]; then
+    dir="${url##*/}"; dir="${dir%.git}"
+  fi
+
+  # Persist the account into the freshly cloned repo. If we already know the
+  # profile, pin it; otherwise fall back to auto-detect (non-fatal so a
+  # successful clone is never undone by an unresolved account).
+  if [ -n "$profile" ]; then
+    ( cd "$dir" && "$GA_ROOT/git-account" use "$profile" )
+  else
+    ( cd "$dir" && "$GA_ROOT/git-account" apply ) || true
+  fi
+}
+
+cmd_doctor() {
+  local rc=0 name
+  info "checking profiles..."
+  for name in $(profile_names); do
+    local sshkey signkey fmt
+    sshkey="$(profile_get "$name" sshkey || true)"
+    if [ -n "$sshkey" ]; then
+      local p; p="$(expand_tilde "$sshkey")"
+      if [ -f "$p" ]; then ok "  [$name] ssh key ok: $p"; else warn "  [$name] ssh key MISSING: $p"; rc=1; fi
+    fi
+    signkey="$(profile_get "$name" signingkey || true)"
+    fmt="$(profile_get "$name" gpgformat || true)"
+    if [ -n "$signkey" ] && [ "$fmt" = "ssh" ]; then
+      local sp; sp="$(expand_tilde "$signkey")"
+      if [ -f "$sp" ]; then ok "  [$name] ssh signing key ok: $sp"; else warn "  [$name] ssh signing key MISSING: $sp"; rc=1; fi
+    fi
+  done
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "current repo:"
+    cmd_whoami || true
+  fi
+  local hp; hp="$(git config --global --get core.hooksPath || true)"
+  if [ "$hp" = "$GA_HOOKS_DIR" ]; then
+    ok "guard hook is enabled (global core.hooksPath -> $hp)."
+  else
+    info "guard hook not enabled. Enable with: git account install-hook"
+  fi
+  return $rc
+}
+
+cmd_install_hook() {
+  ensure_config_dir
+  [ -x "$GA_HOOKS_DIR/pre-commit" ] || die "hook script not found/executable at $GA_HOOKS_DIR/pre-commit"
+  local current; current="$(git config --global --get core.hooksPath || true)"
+  if [ -n "$current" ] && [ "$current" != "$GA_HOOKS_DIR" ]; then
+    # Preserve the previous global hooks dir so the guard can chain to it.
+    cfg_set hook.previoushookspath "$current"
+    info "preserving previous global core.hooksPath: $current"
+  fi
+  git config --global core.hooksPath "$GA_HOOKS_DIR"
+  ok "guard hook enabled (global core.hooksPath -> $GA_HOOKS_DIR)."
+  info "disable any time with: git account uninstall-hook"
+}
+
+cmd_uninstall_hook() {
+  local current prev
+  current="$(git config --global --get core.hooksPath || true)"
+  if [ "$current" != "$GA_HOOKS_DIR" ]; then
+    warn "global core.hooksPath is not managed by git-account (currently: ${current:-<unset>}); leaving as-is."
+    return 0
+  fi
+  prev="$(cfg_get hook.previoushookspath || true)"
+  if [ -n "$prev" ]; then
+    git config --global core.hooksPath "$prev"
+    cfg_unset hook.previoushookspath
+    ok "restored previous global core.hooksPath: $prev"
+  else
+    git config --global --unset core.hooksPath || true
+    ok "guard hook disabled (global core.hooksPath unset)."
+  fi
+}
+
+# --- internal: guard + hook chaining (invoked by hooks/pre-commit) ---------
+
+_guard_identity() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local profile want have
+  profile="$(local_get account.profile || true)"
+  if [ -z "$profile" ]; then
+    # Repo not assigned yet: try a silent confident auto-apply, else stay quiet
+    # (never block commits just because a profile isn't set).
+    detect_for_repo
+    if [ "$GA_DETECT_STATE" = "confident" ]; then
+      apply_profile "$GA_DETECT_PROFILE" >/dev/null 2>&1 || true
+      info "auto-applied profile '$GA_DETECT_PROFILE' for this repo."
+    fi
+    return 0
+  fi
+  want="$(profile_get "$profile" email || true)"
+  have="$(git config --get user.email || true)"
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    warn "COMMIT BLOCKED: repo is assigned profile '$profile' (email <$want>)"
+    warn "but the commit would use <${have:-unset}>."
+    warn "Fix with: git account use $profile   (or: git account apply)"
+    return 1
+  fi
+  return 0
+}
+
+cmd_hook() {
+  local hookname="${1:-pre-commit}"; shift || true
+
+  # 1) our account guard (only pre-commit cares about identity)
+  if [ "$hookname" = "pre-commit" ]; then
+    _guard_identity || return 1
+  fi
+
+  # 2) chain to a previously-configured global hooks dir
+  local prev; prev="$(cfg_get hook.previoushookspath || true)"
+  if [ -n "$prev" ] && [ -x "$prev/$hookname" ]; then
+    "$prev/$hookname" "$@" || return $?
+  fi
+
+  # 3) chain to the repo-local hook that global hooksPath would otherwise skip
+  local gitdir; gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  if [ -n "$gitdir" ] && [ -x "$gitdir/hooks/$hookname" ]; then
+    "$gitdir/hooks/$hookname" "$@" || return $?
+  fi
+
+  return 0
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: git account remove <profile>"
+  profile_require "$name"
+  profile_remove "$name"
+  ok "removed profile '$name'."
+}
+
+usage() {
+  cat <<'EOF'
+git-account - per-repo GitHub account switcher (identity + auth + signing)
+
+Usage: git account <command> [args]
+
+Profiles:
+  add [name] [flags]     Create/update a profile. With no/insufficient flags it
+                         runs an interactive wizard (and can generate an SSH key).
+  list                   List profiles
+  remove <name>          Delete a profile and its rules
+
+In a repo:
+  apply                  Auto-detect the account (prompt if ambiguous) and apply it
+  use <name>             Force a specific profile onto this repo
+  whoami                 Show the active profile and effective identity
+  clone [--as <p>] <url> [dir]  git clone using an account's key, then apply it
+
+Matching rules:
+  rule add <host[/owner]> <profile>
+  rule remove <host[/owner]> <profile>
+  rule list
+
+Guard hook (opt-in, global):
+  install-hook           Enable the pre-commit guard (sets global core.hooksPath)
+  uninstall-hook         Disable it (restores any previous hooks path)
+
+Other:
+  doctor                 Verify keys/config and current repo status
+  version                Print version
+
+add flags:
+  --name <str> --email <str> --host <host> --ssh-key <path>
+  --signing-key <id|path> --gpg-format <openpgp|ssh> --sign <true|false>
+  --credential-user <str>
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    add)            cmd_add "$@" ;;
+    list|ls)        cmd_list "$@" ;;
+    remove|rm)      cmd_remove "$@" ;;
+    apply)          cmd_apply "$@" ;;
+    use)            cmd_use "$@" ;;
+    whoami|status)  cmd_whoami "$@" ;;
+    clone)          cmd_clone "$@" ;;
+    rule)           cmd_rule "$@" ;;
+    doctor)         cmd_doctor "$@" ;;
+    install-hook)   cmd_install_hook "$@" ;;
+    uninstall-hook) cmd_uninstall_hook "$@" ;;
+    __hook)         cmd_hook "$@" ;;
+    version|--version|-v) printf 'git-account %s\n' "$VERSION" ;;
+    help|--help|-h) usage ;;
+    "")
+      if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cmd_apply
+      else
+        usage
+      fi
+      ;;
+    *) die "unknown command: $cmd (try: git account help)" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# git-account guard hook (installed globally via `git account install-hook`).
+#
+# This file lives in the plugin's hooks dir, which becomes the global
+# core.hooksPath. It is intentionally thin: it delegates the account check
+# AND the chaining to any repo-local / previously-configured hooks to the
+# plugin, so existing hooks are never silently skipped.
+set -euo pipefail
+
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+if [ -x "$hook_dir/../git-account" ]; then
+  exec "$hook_dir/../git-account" __hook pre-commit "$@"
+elif command -v git-account >/dev/null 2>&1; then
+  exec git-account __hook pre-commit "$@"
+else
+  # Plugin not found: fail open so commits are never blocked by a broken install.
+  echo "git-account: guard hook could not locate git-account; skipping check." >&2
+  exit 0
+fi
