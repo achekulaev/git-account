@@ -50,7 +50,9 @@ load test_helper
 # Regression: the interactive picker uses an array split that must work on the
 # bash 3.2 shipped by macOS (no `mapfile`). Drive the prompt from piped stdin.
 @test "interactive ambiguous apply lets you pick a profile (bash 3.2 safe)" {
-  add_two_profiles   # personal + work both on github.com -> ambiguous
+  add_two_profiles
+  "$GA" rule add github.com personal >/dev/null   # two host rules -> ambiguous
+  "$GA" rule add github.com work >/dev/null
   repo="$(make_repo r git@github.com:someone/thing.git)"
 
   run env GIT_ACCOUNT_ASSUME_TTY=1 bash -c "cd '$repo' && '$GA'" <<< "2"

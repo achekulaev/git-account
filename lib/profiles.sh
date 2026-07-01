@@ -4,7 +4,7 @@
 # Layout:
 #   profile.<name>.name           display name (user.name)
 #   profile.<name>.email          user.email
-#   profile.<name>.host           host used for auto-matching (e.g. github.com)
+#   profile.<name>.host           host for HTTPS credential wiring (e.g. github.com); NOT a matcher
 #   profile.<name>.sshkey         path to SSH private key (optional)
 #   profile.<name>.signingkey     GPG key id or SSH key path (optional)
 #   profile.<name>.gpgformat      "openpgp" or "ssh" (optional)

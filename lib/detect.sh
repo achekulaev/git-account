@@ -38,19 +38,6 @@ parse_remote_url() {
   [ -n "$GA_HOST" ]
 }
 
-# Profiles that declared this host in profile.<name>.host.
-_profiles_with_host() {
-  local host="$1" out key val name
-  out="$(git config -f "$GA_CONFIG_FILE" --get-regexp '^profile\..+\.host$' 2>/dev/null || true)"
-  [ -n "$out" ] || return 0
-  while read -r key val; do
-    if [ "$val" = "$host" ]; then
-      name="${key#profile.}"; printf '%s\n' "${name%.host}"
-    fi
-  done <<< "$out"
-  return 0
-}
-
 # Profiles whose rules match an exact pattern (host or host/owner).
 _profiles_with_rule() {
   local want="$1" out key val
@@ -69,14 +56,12 @@ _uniq_nonempty() { sort -u | sed '/^$/d'; }
 #       GA_DETECT_PROFILE (when confident),
 #       GA_DETECT_CANDIDATES (newline list when ambiguous).
 _detect_from_host_owner() {
-  # Most specific tier wins: owner rule > host rule > profile host field.
+  # Matching is rule-driven only: an owner rule (host/owner) beats a host rule.
+  # The profile's `host` field is NOT a matcher -- add an explicit rule to match.
   local chosen
   chosen="$(_profiles_with_rule "$GA_HOST/$GA_OWNER" | _uniq_nonempty)"
   if [ -z "$chosen" ]; then
     chosen="$(_profiles_with_rule "$GA_HOST" | _uniq_nonempty)"
-  fi
-  if [ -z "$chosen" ]; then
-    chosen="$(_profiles_with_host "$GA_HOST" | _uniq_nonempty)"
   fi
 
   local n

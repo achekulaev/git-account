@@ -5,7 +5,7 @@
 # Installed as `git-account` on PATH, git invokes it as `git account ...`.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # --- locate ourselves (resolving symlinks) so we can source lib/ -----------
 _resolve_self() {
@@ -145,12 +145,15 @@ cmd_add() {
 
     if [ "$sshkey_explicit" -ne 1 ]; then
       local ans
-      ans="$(prompt_default 'SSH private key path (Enter = generate a new key, "none" = skip)')"
-      case "$ans" in
-        "")          f_sshkey="$(generate_ssh_key "$name" "$f_email" "${f_host:-github.com}")" ;;
-        none|skip|-) f_sshkey="" ;;
-        *)           f_sshkey="$(expand_tilde "$ans")" ;;
-      esac
+      while :; do
+        ans="$(prompt_default 'SSH private key path (Enter = generate a new key, "none" = skip)')"
+        case "$ans" in
+          "")          f_sshkey="$(generate_ssh_key "$name" "$f_email" "${f_host:-github.com}")"; break ;;
+          none|skip|-) f_sshkey=""; break ;;
+          *.pub)       warn "'$ans' looks like a PUBLIC key. Please provide the PRIVATE key (the file without the .pub extension)."; continue ;;
+          *)           f_sshkey="$(expand_tilde "$ans")"; break ;;
+        esac
+      done
     fi
 
     # Offer to reuse the SSH key for commit signing (modern SSH signing).
@@ -167,6 +170,10 @@ cmd_add() {
   [ -n "$f_email" ] || die "profile requires an email (--email), or run interactively."
   [ -n "$f_host" ]  || f_host="github.com"
 
+  case "$f_sshkey" in
+    *.pub) die "--ssh-key expects a PRIVATE key, not a public key ('$f_sshkey'). Provide the private key path (without the .pub extension)." ;;
+  esac
+
   profile_set "$name" name  "$f_name"
   profile_set "$name" email "$f_email"
   profile_set "$name" host  "$f_host"
@@ -176,11 +183,9 @@ cmd_add() {
   [ -n "$f_sign" ]      && profile_set "$name" sign "$f_sign"
   [ -n "$f_cred" ]      && profile_set "$name" credentialuser "$f_cred"
 
-  # A host-level rule lets auto-detect find this profile immediately.
-  rule_add "$name" "$f_host"
-
   ok "saved profile '$name' ($f_email)."
   [ -n "$f_sshkey" ] && info "ssh key: $f_sshkey"
+  info "to auto-detect this account, add a rule: git account rule add ${f_host}[/owner] $name"
   return 0
 }
 
@@ -204,6 +209,7 @@ cmd_list() {
     rules="$(git config -f "$GA_CONFIG_FILE" --get-all "rule.$name" 2>/dev/null | paste -sd ' ' - || true)"
     [ -n "$rules" ] && printf '    rules:   %s\n' "$rules"
   done <<< "$names"
+  return 0
 }
 
 cmd_whoami() {

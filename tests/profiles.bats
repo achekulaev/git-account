@@ -24,12 +24,11 @@ load test_helper
   [[ "$output" == *"invalid profile name"* ]]
 }
 
-@test "adding a profile creates a host-level rule" {
+@test "adding a profile does NOT create any matching rule" {
   "$GA" add work --name W --email w@e.com --host github.acme.com >/dev/null
   run "$GA" rule list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"github.acme.com"* ]]
-  [[ "$output" == *"work"* ]]
+  [[ "$output" == *"no rules defined"* ]]
 }
 
 @test "remove deletes the profile and its rules" {

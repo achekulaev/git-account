@@ -12,8 +12,9 @@ required — clone repos wherever you like.
 ```
 $ git account add work --name "Work Person" --email me@corp.com \
     --host github.com --ssh-key ~/.ssh/id_work
+$ git account rule add github.com/acme-corp work   # route this org to 'work'
 $ git clone git@github.com:acme-corp/service.git && cd service
-$ git account apply            # auto-detects, or asks once and remembers
+$ git account apply            # auto-detects via the rule, or asks once and remembers
 git-account: applied profile 'work' (auto-detected from github.com).
 ```
 
@@ -32,10 +33,15 @@ Everything maps onto native git config keys, so "remembering" is free:
 Profiles and matching rules are stored in `~/.config/git-account/config`
 (read/written via `git config -f`, so no parser is needed).
 
-Auto-detection (hybrid): the account is chosen from the repo's remote host and
-owner. If exactly one profile/rule matches it is applied silently; if several
-match (e.g. two accounts on `github.com`) it prompts once and remembers your
-choice as an owner-level rule so it is silent next time.
+Auto-detection is **rule-driven**: the account is chosen by matching the repo's
+remote `host[/owner]` against the rules you've defined (`git account rule add`).
+An owner rule (`github.com/acme-corp`) beats a host rule (`github.com`). If
+exactly one rule matches it is applied silently; if several match (e.g. two
+accounts both ruled to `github.com`) it prompts once and remembers your choice
+as an owner-level rule so it is silent next time; if none match it asks which
+account to use. A profile's `host` field is only used to wire up HTTPS
+credentials — it is **not** a matcher, so accounts never get force-applied to a
+whole host without an explicit rule.
 
 ## Installation
 
@@ -81,6 +87,58 @@ cp dist/git-account ~/bin/          # anywhere on PATH
 
 > Installing only puts `git-account` on your PATH. The commit **guard hook is
 > opt-in** and is never enabled automatically (see below).
+
+## Uninstalling
+
+Removing the binary does **not** remove the state git-account created. In
+particular, uninstalling the package does not run any cleanup.
+
+**Only if you enabled the guard hook** (i.e. you ran `git account install-hook`
+— it is opt-in and never enabled automatically), disable it first, *while the
+binary still exists*:
+
+```bash
+git account uninstall-hook
+```
+
+This restores or unsets the global `core.hooksPath`. Skipping it when the hook
+was enabled leaves git pointing at a hooks directory that no longer exists,
+which breaks commits everywhere. If you never ran `install-hook`, skip this step.
+
+Then remove the binary using **one** of these — whichever matches how you
+installed:
+
+```bash
+# Homebrew:
+brew uninstall git-account
+```
+
+```bash
+# From source with make (match your install PREFIX):
+make uninstall PREFIX=/usr/local
+```
+
+```bash
+# curl installer / ./install.sh / single-file drop-in:
+rm -f ~/.local/bin/git-account
+```
+
+Finally, remove leftover state that is intentionally **not** touched by any
+uninstall step:
+
+```bash
+# Profiles and matching rules (safe to delete once you no longer need them):
+rm -rf ~/.config/git-account
+
+# Optional: generated SSH keys, if you let the wizard create any:
+#   ls ~/.ssh/id_ed25519_*      # inspect first, then remove the ones you want
+```
+
+Per-repo settings (`user.name/email`, `core.sshCommand`, `account.profile`,
+signing keys) live in each repo's local `.git/config` and are left as-is; they
+are harmless without the plugin, but you can clear a repo with
+`git config --local --remove-section account` (and unset any keys you no longer
+want) if desired.
 
 ## Usage
 
